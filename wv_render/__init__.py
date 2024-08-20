@@ -6,21 +6,22 @@ import pyfftw.builders
 import numpy as np
 
 import skia
-import ffmpeg
 
 import argparse
 
+from os.path import splitext
+from .ffmpeg import FFmpegOutput
 
 parser = argparse.ArgumentParser()
 parser.add_argument('INPUT', type=argparse.FileType('rb'))
-parser.add_argument('OUTPUT')
 parser.add_argument('--width', type=int, default=1920, help='height of visualization')
 parser.add_argument('--height', type=int, default=1080, help='width of visualization')
+parser.add_argument('--min-frequency', type=int, default=50, help='minimum frequency')
 parser.add_argument('--max-frequency', type=int, default=10000, help='max frequency on display')
-parser.add_argument('--stroke-color', type=skia.Color, default=skia.ColorBLACK, help='stroke color')
-parser.add_argument('--background-color', type=skia.Color, default=skia.ColorYELLOW, help='background color')
+parser.add_argument('--stroke-color', type=lambda c: skia.Color4f.FromColor(int(c, base=16)), default=skia.ColorBLACK, help='stroke color')
+parser.add_argument('--background-color', type=lambda c: skia.Color4f.FromColor(int(c, base=16)), default=skia.ColorYELLOW, help='background color')
 parser.add_argument('--stroke-width', type=float, default=2, help='stroke width of path')
-parser.add_argument('--gain', type=float, default=1.5, help='spectral gain (increases peak height)')
+parser.add_argument('--gain', type=float, default=2, help='spectral gain (increases peak height)')
 
 args = parser.parse_args()
 
@@ -39,7 +40,12 @@ paint = skia.Paint(
     Color=args.stroke_color,
 )
 path = skia.Path()
+bg_color = args.background_color
+
+# Hanning window with 50% overlap (optimal)
 hann = np.hanning(2048)
+
+margin = 0.05 * args.width  # 0.05vw
 
 with sf.SoundFile(args.INPUT) as f:
     # TODO Frame synchronization is a problem (i.e. the rate which blocks are read
@@ -49,31 +55,26 @@ with sf.SoundFile(args.INPUT) as f:
     bins = np.empty((1025, f.channels), dtype='float')
     bars = np.empty(1025, dtype='float')
 
-    # Only n/2+1 elements of DFT matter, due to Hermitian symmetry of real-valued data
     fft = pyfftw.builders.rfft(samples, axis=0)
-    max_bin = int(2048 / f.samplerate * args.max_frequency) # Max 8000Hz (F = n * Fs/N)
+    bin_width = 2048 / f.samplerate
+    
+    min_bin = int(bin_width * args.min_frequency)
+    max_bin = int(bin_width * args.max_frequency) # (F = n * Fs/N)
 
     # TODO What should the first point be?
-    points = [skia.Point(0, args.height/2)] + \
-             [skia.Point(0, 0) for _ in range(max_bin)]
+    points = [skia.Point(0, 0) for _ in range(max_bin - min_bin)]
     
-    # TODO Either allow user to customize the FFmpeg options, or get rid of FFmpeg.
-    # Ideally, FFmpeg would have been beneficial if we could feed it GL surfaces
-    # and use hardware accelarated codecs (VAAPI, CUDA, etc.) that would use these
-    # hardware surfaces directly and encode us a video
-    process = (
-        ffmpeg.input('pipe:', format='rawvideo', pix_fmt='rgb0', s=f'{args.width}x{args.height}',
-                     framerate=f.samplerate/1024)
-              .output(args.OUTPUT, pix_fmt='yuv420p')
-              .overwrite_output()
-              .run_async(pipe_stdin=True)
-    )
+    # TODO Either allow user to customize the FFmpeg options, or get rid of FFmpeg
+    # process = setup_ffmpeg_for_output(args.INPUT.name, args.width, args.height, f.samplerate/1024)
 
-    coeff1 = args.height / (1024 * f.channels) * args.gain
-    xstep = args.width / max_bin
+    output_file = splitext(args.INPUT.name)[0] + '.mkv'
+    ffmpeg_output = FFmpegOutput(output_file, args.width, args.height, fps=f.samplerate/1024)
+
+    height = args.height
+    coeff1 = height / (1024 * f.channels) * args.gain
+    xstep = (args.width - 2 * margin) / (max_bin - min_bin)
 
     with skia.Surface.MakeRaster(surface_info) as canvas:
-        # TODO use the von-Hann window function
         for _ in f.blocks(out=samples, overlap=1024):
             for c in range(f.channels):
                 np.multiply(samples[:,c], hann, out=samples[:,c])
@@ -89,24 +90,24 @@ with sf.SoundFile(args.INPUT) as f:
             path.reset()
 
             # Clear the screen
-            canvas.drawColor(args.background_color)
+            canvas.drawColor(bg_color)
 
-            x = 0
+            x = margin
+            i = 1
             sign = 1 # This creates a wavy effect (Adobe AE)
 
-            for i, v in enumerate(bars[1:max_bin+1]):
-                points[i+1].set(x, args.height/2 - sign * coeff1 * v/2)
+            # Skip the DC coefficient, which is just the average of all bin values.
+            for i, v in enumerate(bars[min_bin:max_bin]):
+                points[i].set(x, height/2 - sign * coeff1 * v/2)
                 x += xstep
                 sign *= -1
 
             path.addPoly(points, False)
+
             canvas.drawPath(path, paint)
             canvas.peekPixels(pixmap)
 
-            process.stdin.write(pixmap)
+            ffmpeg_output.write_pixmap(pixmap)
         
-        # All has finished now
-        process.stdin.close()
-        
-    # Wait for FFmpeg to finish encoding
-    process.wait()
+    # Cleanup
+    ffmpeg_output.flush()

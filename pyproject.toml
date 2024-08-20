@@ -10,9 +10,8 @@ package-mode = false
 python        = "^3.12"
 pyFFTW        = "^0.14.0"
 soundfile     = "^0.12.1"
+av            = "^12.3.0"
 skia-python   = "^87.6"
-ffmpeg-python = "^0.2.0"
-glfw = "^2.7.0"
 
 
 [build-system]
